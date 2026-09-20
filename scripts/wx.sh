@@ -2,8 +2,9 @@
 # 微信固定操作入口 —— 默认只把草稿填进发送框，绝不自动发送。
 #
 #   wx draft "<会话名>" "<文字>"    默认动作：交给后台服务填进输入框（不发送），再回报待确认卡片
-#   wx send  "<会话名>" "<文字>" --confirm
-#                                  仅当使用者核对过并明确说「发」时才用；缺 --confirm 直接拒发
+#   wx send  "<会话名>" "<文字>" --confirm [--force]
+#                                  仅当使用者核对过并明确说「发」时才用；缺 --confirm 直接拒发；
+#                                  目标会话最近一条已是同内容时会被拦下（疑似重复，多为使用者已手动发过），--force 才强行重发
 #   wx check "<会话名>" [--force]  开会话 + 读屏，回报表头、输入框、最近原文；别的会话有未发送草稿时会被拦下
 #   wx clear "<会话名>"             清空该会话输入框（撤掉草稿）
 #   wx context "<会话名>" [N]       只看最近 N 条原文（默认 5），不碰界面
@@ -230,16 +231,17 @@ case "$cmd" in
     ;;
 
   send)
-    chat="${2:-}"; text="${3:-}"; confirm="${4:-}"
-    [ -n "$chat" ] && [ -n "$text" ] || die "用法：wx send \"<会话名>\" \"<文字>\" --confirm"
+    chat="${2:-}"; text="${3:-}"; confirm="${4:-}"; force=0
+    for a in "$@"; do [ "$a" = "--force" ] && force=1; done
+    [ -n "$chat" ] && [ -n "$text" ] || die "用法：wx send \"<会话名>\" \"<文字>\" --confirm [--force]"
     if [ "$confirm" != "--confirm" ] && [ "${WX_SEND_CONFIRMED:-}" != "1" ]; then
       echo "已阻止发送：send 需要显式确认。"
       echo "  默认请用：wx draft \"$chat\" \"$text\""
       echo "  使用者核对过那条草稿后，再跑：wx send \"$chat\" \"$text\" --confirm"
       exit 9
     fi
-    echo "已提交后台服务（会真的发出）…"
-    submit send "$chat" "$text" 1
+    echo "已提交后台服务（会真的发出；若最近一条已是同内容会被拦下，需 --force 才强行重发）…"
+    submit send "$chat" "$text" 1 "$force"
     exit $?
     ;;
 

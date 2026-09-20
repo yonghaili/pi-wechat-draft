@@ -720,11 +720,39 @@ def act_clear(gui: Gui, job) -> dict:
     return {"ok": False, "error": "3 次后输入行仍有墨迹", "input_row": row}
 
 
+def duplicate_send_guard(last_msgs, text: str, force: bool):
+    """“疑似重复发送”闸门：目标会话最近一条就是同内容（或互相包含）时返回错误 dict。
+
+    为什么需要：使用者可能**在并行手动操作微信**（2026-09-20 实测：我说要发时他已经在手动发送同一条
+    文字并手转发了卡片，结果发重了）。判定只看目标会话的最近一条，不做模糊联想；宁可多问一句。
+    注意：本闸门依赖 `WX_READER`（要读聊天记录），未配置时直接放行并记日志。
+    """
+    if force:
+        return None
+    if not last_msgs:
+        return None
+    last = last_msgs[-1]
+    lt = (last.get("text") or "").strip()
+    nt = (text or "").strip()
+    if last.get("from_me") and lt and nt and (lt == nt or nt in lt or lt in nt):
+        return {"ok": False, "method": "blocked_duplicate_send",
+                "error": (f"已中止发送：目标会话最近一条（{last.get('time')}）已是相同内容"
+                          f"（{lt[:40]!r}…），疑似重复（使用者可能已手动发过）。"
+                          "确实要再发一次请加 --force"),
+                "evidence": {"last": last}}
+    return None
+
+
 def act_send(gui: Gui, job) -> dict:
     chat, text = job["chat"], job.get("text", "")
     if not job.get("confirm"):
         return {"ok": False, "error": "缺少 confirm=true，拒绝发送"}
     pre = read_context(chat, 1)
+    if READER is None:
+        log("  未配置 WX_READER，跳过“疑似重复发送”检查")
+    dup = duplicate_send_guard(pre, text, bool(job.get("force")))
+    if dup:
+        return dup
     if not gui.require_front():
         return {"ok": False, "error": "微信未能切到前台，未发送"}
     if not gui.open(chat):
