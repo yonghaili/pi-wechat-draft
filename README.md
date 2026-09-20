@@ -175,7 +175,7 @@ python scripts/selfcheck.py                                    # 语法 / 换行
 EXTRA_DENY='你的名字|某个联系人' python scripts/selfcheck.py      # 本地追加私有词，不必提交
 ```
 
-自检脚本本身不含任何个人姓名（否则它自己就成了泄漏源），只在扫描时跳过自己。CI 配置放在 `ci/selfcheck.yml`（推 `workflow` 文件需要 `workflow` scope，启用方法见 `ci/README.md`），任务只有一步：`python scripts/selfcheck.py`——和你在本地跑的是同一份检查。
+自检脚本本身不含任何个人姓名（否则它自己就成了泄漏源），只在扫描时跳过自己。CI 在 `.github/workflows/selfcheck.yml`，任务只有一步：`python scripts/selfcheck.py`——和你在本地跑的是同一份检查。（提示：推送 workflow 文件要求 token 带 `workflow` scope，否则 GitHub 会直接拒收；补授权用 `gh auth refresh -s workflow`。）
 
 ## License
 

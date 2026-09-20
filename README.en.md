@@ -166,7 +166,7 @@ python scripts/selfcheck.py                       # bash -n, ast, LF, ASCII, hyg
 EXTRA_DENY='your-name|a-contact' python scripts/selfcheck.py   # add private tokens locally
 ```
 
-The checker deliberately contains no personal names, so it can never become the leak. The GitHub Actions config lives in [`ci/selfcheck.yml`](ci/selfcheck.yml) rather than `.github/workflows/` because pushing a workflow file needs a token with the `workflow` scope — see [`ci/README.md`](ci/README.md) for the two ways to enable it.
+The checker deliberately contains no personal names, so it can never become the leak. CI runs it on every push via [`.github/workflows/selfcheck.yml`](.github/workflows/selfcheck.yml). (Note: pushing a workflow file requires a token with the `workflow` scope — GitHub rejects the push otherwise; grant it with `gh auth refresh -s workflow`.)
 
 ## License
 
