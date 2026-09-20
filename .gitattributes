@@ -1,0 +1,4 @@
+# 换行符：sh / py / ps1 必须保持 LF —— 否则在 Git Bash 里执行会因 \r 报错
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

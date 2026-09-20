@@ -1,0 +1,18 @@
+# runtime state — never commit these
+venv/
+queue/
+logs/
+wechatauto_logs/
+
+# python
+__pycache__/
+*.py[cod]
+
+# service state
+wx-service.pid
+wx-service.state.json
+@AutomationLog.txt
+
+# local test artifacts
+*.log
+*.png
