@@ -46,6 +46,7 @@ QUEUE = BASE / "queue"
 LOGS = BASE / "logs"
 PIDFILE = BASE / "wx-service.pid"
 STATEFILE = BASE / "wx-service.state.json"
+PENDING = BASE / "draft-pending.json"      # 已填入但未发送的草稿（用于阻止“切会话把它冲掉”）
 OCR_PS1 = SCRIPT_DIR / "wx-ocr.ps1"
 # 可选：更强的独立复核后端（自己的只读微信读取器）。
 # 不配置时本工具只靠 UIA 控件回读 + OCR 像素复核，功能完整，
@@ -820,11 +821,45 @@ def mark(label: str, t0: float) -> None:
     log(f"  · {label} {time.time() - t0:.1f}s")
 
 
+def load_pending():
+    """读“待发草稿”记录；无记录返回 None。"""
+    try:
+        return json.loads(PENDING.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def remember_pending(chat: str, text: str, job_id: str) -> None:
+    try:
+        PENDING.write_text(json.dumps({"chat": chat, "text": text, "job": job_id,
+                                       "at": datetime.now().isoformat(timespec="seconds")},
+                                      ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:
+        log(f"  记录待发草稿失败: {e}")
+
+
+def forget_pending() -> None:
+    try:
+        PENDING.unlink()
+    except OSError:
+        pass
+
+
 def run_job(job) -> dict:
     action = job.get("action")
     fn = ACTIONS.get(action)
     if not fn:
         return {"ok": False, "error": f"未知动作 {action}"}
+
+    # 闸门：已有未发送的草稿时，禁止切到别的会话（切换会把草稿冲掉，2026-09-20 实测）
+    pend = load_pending()
+    if pend and action == "check" and not job.get("force"):
+        if not Gui.chat_name_matches(pend.get("chat"), job.get("chat")):
+            return {"ok": False, "method": "blocked_by_pending_draft",
+                    "error": (f"已阻止切换会话：「{pend.get('chat')}」里有已填入未发送的草稿"
+                              f"（{pend.get('text')!r}），切走会把它冲掉。"
+                              "要检查其它会话请先处理该草稿（wx send --confirm 或 wx clear），"
+                              "确实要先看别的会话就加 --force")}
     gui = GUI
     gui.front_started = None        # 每个任务重新计“微信在前台占了多久”
     started = time.time()
@@ -842,6 +877,12 @@ def run_job(job) -> dict:
     except Exception:
         res = {"ok": False, "error": "异常: " + traceback.format_exc(limit=3)}
     res.setdefault("ok", False)
+    # 待发草稿记账：draft 成功则记下（挡住后续切会话）；send/clear 成功则注销
+    if res.get("ok"):
+        if action == "draft":
+            remember_pending(job.get("chat", ""), job.get("text", ""), job.get("id", ""))
+        elif action in ("send", "clear"):
+            forget_pending()
     res["window"] = state
     res["seconds"] = round(time.time() - started, 1)
     res["foreground_seconds"] = (round(time.time() - gui.front_started, 1)

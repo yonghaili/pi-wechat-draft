@@ -4,7 +4,7 @@
 #   wx draft "<会话名>" "<文字>"    默认动作：交给后台服务填进输入框（不发送），再回报待确认卡片
 #   wx send  "<会话名>" "<文字>" --confirm
 #                                  仅当使用者核对过并明确说「发」时才用；缺 --confirm 直接拒发
-#   wx check "<会话名>"             开会话 + 读屏，回报表头、输入框、最近原文
+#   wx check "<会话名>" [--force]  开会话 + 读屏，回报表头、输入框、最近原文；别的会话有未发送草稿时会被拦下
 #   wx clear "<会话名>"             清空该会话输入框（撤掉草稿）
 #   wx context "<会话名>" [N]       只看最近 N 条原文（默认 5），不碰界面
 #   wx resolve "<关键词>"           把口语叫法（如「张工」）解析成候选会话名（需配置 WX_READER）
@@ -105,7 +105,7 @@ print("最近一次：%s %s → ok=%s %s" % (last.get("action"), last.get("chat"
 
 # ------------------------------------------------------------------ 提交任务
 submit() {
-  local action="$1" chat="$2" text="${3:-}" confirm="${4:-0}"
+  local action="$1" chat="$2" text="${3:-}" confirm="${4:-0}" force="${5:-0}"
   svc_start || return 1
   mkdir -p "$QUEUE"
   local id seq
@@ -115,8 +115,9 @@ submit() {
 import json,sys
 job=dict(zip(("id","action","chat","text","confirm","created"),
              (sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5],sys.argv[6]=="1",sys.argv[7])))
+job["force"] = (len(sys.argv) > 8 and sys.argv[8] == "1")
 open(sys.argv[1],"w",encoding="utf-8").write(json.dumps(job,ensure_ascii=False))
-' "$QUEUE/$seq.$id.job" "$id" "$action" "$chat" "$text" "$confirm" "$(date +%Y-%m-%dT%H:%M:%S)"
+' "$QUEUE/$seq.$id.job" "$id" "$action" "$chat" "$text" "$confirm" "$(date +%Y-%m-%dT%H:%M:%S)" "$force"
   local start; start=$(date +%s)
   echo "任务号：$id"
   while [ ! -f "$QUEUE/$id.result" ]; do
@@ -243,9 +244,10 @@ case "$cmd" in
     ;;
 
   check)
-    chat="${2:-}"
-    [ -n "$chat" ] || die "用法：wx check \"<会话名>\""
-    submit check "$chat" "" 0
+    chat="${2:-}"; force=0
+    [ "${3:-}" = "--force" ] && force=1
+    [ -n "$chat" ] || die "用法：wx check \"<会话名>\" [--force]"
+    submit check "$chat" "" 0 "$force"
     exit $?
     ;;
 
