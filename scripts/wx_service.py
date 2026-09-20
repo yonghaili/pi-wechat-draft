@@ -378,14 +378,32 @@ class Gui:
             log(f"  WeChatGUI 就绪（{time.time()-t0:.1f}s）")
         return self._gui
 
+    def current_chat_live(self):
+        """现场用 UIA 读当前打开的会话名（不信任任何缓存）。
+
+        库自带的 `_current_chat` 是它自己的缓存，**使用者手动切换会话后不会更新**——
+        2026-09-20 就是因此把草稿填进了错误的会话：缓存说目标已打开，实际打开的是另一个。
+        """
+        try:
+            u = self.get()._get_uia()
+            if u is None or not u.is_materialized():
+                return None
+            return u.current_chat()
+        except Exception:
+            return None
+
     def open(self, chat: str) -> bool:
-        gui = self.get()
-        if self._chat == chat and getattr(gui, "_current_chat", None) == chat:
-            return True
         t0 = time.time()
-        ok = bool(gui.open_chat(chat))
-        if ok:
+        if self.current_chat_live() == chat:      # 现场核对，不信任缓存
             self._chat = chat
+            return True
+        ok = bool(self.get().open_chat(chat))
+        live = self.current_chat_live()
+        if ok and (live is None or live == chat):
+            self._chat = chat
+        else:
+            log(f"  打开会话 {chat} 后现场读到的是 {live!r}，判定未打开")
+            ok = False
         mark(f"打开会话 {chat}", t0)
         return ok
 
@@ -617,11 +635,21 @@ def act_draft(gui: Gui, job) -> dict:
     _t = time.time()
     ok, back, ctrl_chat = gui.set_input_text(text)
     mark("ValuePattern 直写+回读", _t)
-    if ok and (not ctrl_chat or gui.chat_name_matches(ctrl_chat, chat)):
+    if ok and gui.chat_name_matches(ctrl_chat, chat):
         return {"ok": True, "method": "value_pattern", "readback": back,
                 "evidence": {"chat": chat, "text": text, "chars": len(text),
                              "ctrl_chat_name": ctrl_chat, "context": ctx}}
-    log(f"  ValuePattern 未成功（回读={back!r} 控件会话={ctrl_chat!r}），回退库的粘贴路径")
+    if ctrl_chat and not gui.chat_name_matches(ctrl_chat, chat):
+        # 控件属于别的会话：**绝不回退**。回退路径是“往当前打开的会话里粘贴”，
+        # 2026-09-20 就是这条把草稿填进了错误会话（“午托”群），必须直接中止。
+        return {"ok": False, "method": "aborted_wrong_chat", "readback": back,
+                "error": f"目标会话未打开：输入框控件属于「{ctrl_chat}」，已中止且未继续输入",
+                "evidence": {"chat": chat, "text": text, "ctrl_chat_name": ctrl_chat, "context": ctx}}
+    log(f"  ValuePattern 未成功（回读={back!r} 控件会话={ctrl_chat!r}）")
+    live = gui.current_chat_live()
+    if live and not gui.chat_name_matches(live, chat):
+        return {"ok": False, "error": f"当前打开的是「{live}」而不是目标会话，已中止（不回退粘贴）"}
+    log("  回退库的粘贴路径（已确认现场会话就是目标）")
 
     # 回退：库的「点击输入框 + 剪贴板粘贴」（本机坐标空间不一致，不可靠，必验）
     box = gui.box()
@@ -654,9 +682,15 @@ def act_clear(gui: Gui, job) -> dict:
     _t = time.time()
     ok, back, ctrl_chat = gui.set_input_text("")
     mark("ValuePattern 清空+回读", _t)
+    if ctrl_chat and not gui.chat_name_matches(ctrl_chat, chat):
+        return {"ok": False, "method": "aborted_wrong_chat",
+                "error": f"目标会话未打开：输入框控件属于「{ctrl_chat}」，已中止（绝不会去清别的会话）"}
     if ok:
         return {"ok": True, "method": "value_pattern", "input_row": "",
                 "evidence": {"chat": chat, "ctrl_chat_name": ctrl_chat}}
+    live = gui.current_chat_live()
+    if live and not gui.chat_name_matches(live, chat):
+        return {"ok": False, "error": f"当前打开的是「{live}」而不是目标会话，已中止清空"}
     log(f"  ValuePattern 清空未成功（回读={back!r}），回退 Ctrl+A/Delete 路径")
 
     g = gui.get()
@@ -702,12 +736,19 @@ def act_send(gui: Gui, job) -> dict:
     ok, back, ctrl_chat = gui.set_input_text(text)
     mark("ValuePattern 直写+回读", _t)
     method = "value_pattern"
-    if ok and (not ctrl_chat or gui.chat_name_matches(ctrl_chat, chat)):
+    if ok and gui.chat_name_matches(ctrl_chat, chat):
         _t = time.time()
         if not gui.press_enter_in_input():
             return {"ok": False, "error": "已写入但回车未发出", "readback": back}
         mark("回车发送", _t)
+    elif ctrl_chat and not gui.chat_name_matches(ctrl_chat, chat):
+        # 控件属于别的会话：**绝不发送，也不回退**
+        return {"ok": False, "method": "aborted_wrong_chat", "readback": back,
+                "error": f"目标会话未打开：输入框控件属于「{ctrl_chat}」，已中止（绝不发送）"}
     else:
+        live = gui.current_chat_live()
+        if live and not gui.chat_name_matches(live, chat):
+            return {"ok": False, "error": f"当前打开的是「{live}」而不是目标会话，已中止（绝不发送）"}
         log(f"  ValuePattern 未成功（回读={back!r}），回退库的粘贴+click_send")
         method = "clipboard+click_send"
         box = gui.box()
