@@ -2,7 +2,7 @@
 
 **把草稿填进微信输入框，但不替你按发送。** Windows + 微信 4.x 的桌面自动化，带常驻后台服务、逐字回读校验和一套"不打扰使用者"的执行纪律。
 
-> English: A Windows-only toolkit that fills drafts into the WeChat 4.x desktop input box and **never sends on its own**. It runs through a resident background service with a file-based job queue, verifies every write by reading the UI Automation value back character-for-character, and returns focus to whatever window you were using. Ships as a pi skill plus standalone CLI.
+> English: see [README.en.md](README.en.md) for the full English documentation.
 
 ---
 
@@ -167,6 +167,15 @@ git clone https://github.com/yonghaili/pi-wechat-draft.git ~/.pi/agent/skills/we
 ```
 
 `SKILL.md` 里写的是给 agent 的固定流程（先解析对象 → 回读原文 → 只填 → 交付待确认卡片 → 使用者说「发」才发 → 分三层复核）以及每条坑的判据。
+
+## 自检与贡献
+
+```bash
+python scripts/selfcheck.py                                    # 语法 / 换行 / ASCII / 隐私与凭据扫描
+EXTRA_DENY='你的名字|某个联系人' python scripts/selfcheck.py      # 本地追加私有词，不必提交
+```
+
+自检脚本本身不含任何个人姓名（否则它自己就成了泄漏源），只在扫描时跳过自己；每次 push 会在 GitHub Actions 里自动跑一遍（`.github/workflows/selfcheck.yml`）。
 
 ## License
 

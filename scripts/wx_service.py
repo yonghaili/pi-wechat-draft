@@ -277,9 +277,9 @@ def fast_ink() -> str:
     for y in range(0, img.size[1], 2):
         for x in range(0, img.size[0], 2):
             r, g, b = px[x, y]
-            if r + g + b < 450:
-                dark += 1
-    return "ink" if dark > 25 else ""
+            if r + g + b < 400:          # 实测：灰色占位符 sum≈600；空框暗点 37，7 个黑字 146
+                dark += 1                # （旧值 sum<450 / >25 会把空框误判成有字）
+    return "ink" if dark > 60 else ""
 
 
 def ocr_shot(crop: str | None = None, scale: int = 3):
@@ -432,12 +432,30 @@ class Gui:
         except Exception as e:
             return False, f"<err {type(e).__name__}>", name
 
-    def read_input_text(self):
-        """只读：取当前输入框文本（取不到返回 None）。用于“回车后是否已清空”判定。"""
+    @staticmethod
+    def chat_name_matches(ctrl_name: str, chat: str) -> bool:
+        """控件 Name 是否属于目标会话。
+
+        实测（2026-09-20）：chat_input_field 的 Name 有时就是会话名（"张三"），
+        有时会拼上占位符/内容（"张三按住鼠标语音输入文字"）。所以只能用前缀匹配，
+        等值比较会把成功写入误判为失败并降级到回退路径。
+        """
+        n = (ctrl_name or "").strip()
+        c = (chat or "").strip()
+        return bool(n) and bool(c) and (n == c or n.startswith(c))
+
+    def read_input_text(self, expect_chat: str | None = None):
+        """只读：取当前输入框文本（取不到返回 None）。
+
+        expect_chat 传入时会先核对控件 Name（就是会话名），不对就返回 None，
+        避免报出别的会话的内容。
+        """
         ctrl = self.input_ctrl()
         if ctrl is None:
             return None
         try:
+            if expect_chat and not self.chat_name_matches(ctrl.Name, expect_chat):
+                return None
             return ctrl.GetValuePattern().Value
         except Exception:
             return None
@@ -560,11 +578,23 @@ def act_check(gui: Gui, job) -> dict:
         return {"ok": False, "evidence": {"context": ctx},
                 "error": "微信未能切到前台（你正在用别的窗口），读屏不可靠，已跳过"}
     opened = gui.open(chat)
-    ink = fast_ink()
+    # 输入框内容分三层取：① UIA 精确回读（能拿到整段原文，且能核对会话名）；② 像素；
+    # ③ OCR。实测像素法会把灰色占位符误判成有字，所以只当备用。
+    val = gui.read_input_text(expect_chat=chat)
+    if val is not None:
+        input_row, via = ("（空）" if val == "" else val), "uia_value"
+    else:
+        ink = fast_ink()
+        if ink == "ink":
+            input_row, via = "（有内容，但 UIA 读不到原文）", "pixels"
+        elif ink == "":
+            input_row, via = "（空）", "pixels"
+        else:
+            row = input_row_text()
+            input_row, via = (row or "（空）"), "ocr"
     size, rows = ocr_shot(None, scale=1)
     W, H = size or (993, 867)
-    ev = {"opened": opened,
-          "input_row": ("（空）" if ink == "" else ink),
+    ev = {"opened": opened, "input_row": input_row, "input_row_via": via,
           "header": [t for x1, y1, x2, y2, t in rows if y1 < H * 0.15],
           "bottom": [t for x1, y1, x2, y2, t in rows if y1 >= H * 0.45 and x1 >= W * 0.40],
           "context": ctx}
@@ -587,7 +617,7 @@ def act_draft(gui: Gui, job) -> dict:
     _t = time.time()
     ok, back, ctrl_chat = gui.set_input_text(text)
     mark("ValuePattern 直写+回读", _t)
-    if ok and (not ctrl_chat or ctrl_chat == chat):
+    if ok and (not ctrl_chat or gui.chat_name_matches(ctrl_chat, chat)):
         return {"ok": True, "method": "value_pattern", "readback": back,
                 "evidence": {"chat": chat, "text": text, "chars": len(text),
                              "ctrl_chat_name": ctrl_chat, "context": ctx}}
@@ -672,7 +702,7 @@ def act_send(gui: Gui, job) -> dict:
     ok, back, ctrl_chat = gui.set_input_text(text)
     mark("ValuePattern 直写+回读", _t)
     method = "value_pattern"
-    if ok and (not ctrl_chat or ctrl_chat == chat):
+    if ok and (not ctrl_chat or gui.chat_name_matches(ctrl_chat, chat)):
         _t = time.time()
         if not gui.press_enter_in_input():
             return {"ok": False, "error": "已写入但回车未发出", "readback": back}

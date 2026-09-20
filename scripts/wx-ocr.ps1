@@ -1,5 +1,7 @@
-# 截图 + Windows OCR：给不能读图的模型提供微信窗口的文字与坐标
-# 用法: powershell -NoProfile -File wx-ocr.ps1 [-Pid 18364] [-OutDir <dir>] [-RawOnly]
+# Screenshot + Windows.Media.Ocr for the WeChat window: emits every recognized line with its
+# coordinates inside the window, so a model that cannot read images still has something to work with.
+# Usage: powershell -NoProfile -File wx-ocr.ps1 [-ProcId <pid>] [-OutDir <dir>] [-RawOnly]
+#                                   [-Crop "x,y,w,h"] [-Scale N]
 param(
   [int]$ProcId = 0,
   [string]$OutDir = "$env:TEMP",

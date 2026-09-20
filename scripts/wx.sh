@@ -143,7 +143,7 @@ if d.get("readback") is not None: print("控件回读：%r" % d["readback"])
 if d.get("input_row") is not None: print("输入行：%s" % (d["input_row"] or "（空）"))
 if d.get("filled_flag") is not None: print("库返回 filled：%s" % d["filled_flag"])
 if ev.get("opened") is not None: print("会话已开：%s" % ev["opened"])
-if ev.get("input_row") is not None: print("输入行：%s" % (ev["input_row"] or "（空）"))
+if ev.get("input_row") is not None: print("输入行：%s%s" % (ev["input_row"], ("（判据：%s）" % ev["input_row_via"]) if ev.get("input_row_via") else ""))
 if ev.get("header"): print("表头：%s" % " / ".join(ev["header"][:4]))
 if ev.get("bottom"): print("底部：%s" % " / ".join(ev["bottom"][:6]))
 if ev.get("context"):
