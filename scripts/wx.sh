@@ -8,6 +8,8 @@
 #   wx check "<会话名>" [--force]  开会话 + 读屏，回报表头、输入框、最近原文；别的会话有未发送草稿时会被拦下
 #   wx clear "<会话名>"             清空该会话输入框（撤掉草稿）
 #   wx context "<会话名>" [N]       只看最近 N 条原文（默认 5），不碰界面
+#   wx peek "<会话名>" [N]          只读数据库回答“最近说了什么、要不要回”——**零前台**，不开微信窗口
+#   wx doctor                      自检：服务状态、生效配置、两条链路的边界、微信窗口现状、占用基线
 #   wx resolve "<关键词>"           把口语叫法（如「张工」）解析成候选会话名（需配置 WX_READER）
 #   wx svc start|stop|status|log    后台服务管理
 #
@@ -224,6 +226,123 @@ for m in msgs:
 '
 }
 
+# 只读一条会话的最近 N 条 + 判断“要不要回”——全程只读数据库，不碰微信窗口（零前台）。
+# 与 wx check 的区别：check 要开窗口读输入框（占前台几秒），peek 永远不碰界面。
+peek() {
+  local chat="$1" n="${2:-3}"
+  [ -n "$chat" ] || die "用法：wx peek \"<会话名>\" [条数]"
+  [ -n "$READER" ] || die "wx peek 需要只读读取器：请设置 WX_READER（或改用 wx context）"
+  "$SYS_PY" "$READER" history --talker "$chat" --limit "$n" --display-order desc 2>/dev/null \
+    | "$SYS_PY" -c '
+import sys, json
+raw = sys.stdin.read()
+i = raw.find("{")
+if i < 0:
+    print("  （读不到，请检查读取器与密钥）"); raise SystemExit(2)
+msgs = list(reversed(json.loads(raw[i:])["data"].get("messages") or []))
+if not msgs:
+    print("  最近没有消息"); raise SystemExit(0)
+for m in msgs:
+    who = m.get("sender") or ("我" if m.get("from_me") else "?")
+    txt = (m.get("text") or "").strip().replace("\n", " / ") or ("[" + str(m.get("kind_name") or "非文本") + "]")
+    print("  %s｜%s｜%s：%s" % (m.get("time", ""), "我" if m.get("from_me") else "他", who, txt[:90]))
+last = msgs[-1]
+print("  —— 最后一条是%s（%s）" % ("我发的" if last.get("from_me") else "对方发的", last.get("time", "")))
+print("  —— %s" % ("不需要回" if last.get("from_me") else "可能是待回复；要起草就 wx draft"))
+print("  （零前台：只读数据库，全程没碰微信窗口）")
+'
+}
+
+# 自检：把“为什么读能静默、写不能”和当前策略一次说清，并看现场。
+doctor() {
+  echo "════ 微信工具自检 · $(date '+%F %T') ════"
+  if svc_running; then echo "服务：运行中（pid $(svc_pid)）"; else echo "服务：**未运行**（wx svc start）"; fi
+  [ -f "$WX_DIR/wx-service.state.json" ] && echo "  队列状态：$(head -c 240 "$WX_DIR/wx-service.state.json")"
+  echo
+  echo "生效配置（$WX_DIR/wx-service.env）："
+  if [ -f "$WX_DIR/wx-service.env" ]; then
+    grep -vE '^[[:space:]]*(#|$)' "$WX_DIR/wx-service.env" | sed 's/^/  /'
+  else
+    echo "  （无，全用默认值）"
+  fi
+  echo
+  envval() {   # 先读 wx-service.env，再回退 shell 环境/默认值——否则 doctor 会报错值
+    local k="$1" d="${2:-}" v=""
+    if [ -f "$WX_DIR/wx-service.env" ]; then
+      v="$(grep -E "^[[:space:]]*$k=" "$WX_DIR/wx-service.env" | tail -1 | cut -d= -f2- | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    fi
+    [ -n "$v" ] || v="${!k:-$d}"
+    printf '%s' "$v"
+  }
+  echo "两条链路的边界（为什么“读”能静默、“写”不能）："
+  echo "  读（wx peek / context / resolve）＝解密本地 SQLCipher 库，纯文件操作，**永不碰界面、零前台**"
+  echo "  写（wx draft / send / clear / check）＝微信没有本地写接口，只能 GUI 注入；注入要求目标在前台，"
+  echo "    而且它最小化时 UIA 树是空壳，必须先恢复窗口 —— 这是物理约束，不是实现问题"
+  echo "  打开会话：WX_OPEN_MODE=$(envval WX_OPEN_MODE auto)（auto：先试无点击 UIA 路径，失败才回退库的点击路径）"
+  echo "  离屏注入：WX_OFFSCREEN=$(envval WX_OFFSCREEN 0)（1：任务期间把窗口挪到屏幕外；首尾各有约 0.1–0.25s 露面）"
+  echo "  空闲闸门：WX_IDLE_GATE=$(envval WX_IDLE_GATE 2)s（写）/ WX_IDLE_GATE_RO=$(envval WX_IDLE_GATE_RO 0.5)s（只读）"
+  echo
+  if [ -n "$READER" ]; then
+    [ -f "$READER" ] && echo "只读后端：✓ $READER" || echo "只读后端：✗ 文件不存在 $READER"
+  else
+    echo "只读后端：未配置 WX_READER"
+  fi
+  echo
+  "$PY" - <<'PY'
+import ctypes, glob, json, os, pathlib, subprocess
+import ctypes.wintypes as wt
+base = pathlib.Path(os.path.expanduser("~")) / ".pi" / "wechat-ui"
+u = ctypes.windll.user32
+u.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+u.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+pids = set()
+out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
+                     capture_output=True, text=True, errors="replace").stdout or ""
+for row in out.splitlines():
+    parts = [p.strip('" ') for p in row.split('","')]
+    if len(parts) > 1 and parts[1].isdigit():
+        pids.add(int(parts[1]))
+found = []
+def cb(h, l):
+    pid = wt.DWORD(); u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+    if pid.value in pids:
+        c = ctypes.create_unicode_buffer(64); u.GetClassNameW(h, c, 64)
+        if c.value.startswith("Qt") and "QWindowIcon" in c.value:
+            found.append(int(h))
+    return True
+u.EnumWindows(ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)(cb), 0)
+if not found:
+    print("微信窗口：未找到（微信没开？）")
+for h in found:
+    r = wt.RECT(); u.GetWindowRect(wt.HWND(h), ctypes.byref(r))
+    print("微信窗口：hwnd=%d 矩形=(%d,%d)+%dx%d 可见=%s 最小化=%s%s" % (
+        h, r.left, r.top, r.right - r.left, r.bottom - r.top,
+        bool(u.IsWindowVisible(wt.HWND(h))), bool(u.IsIconic(wt.HWND(h))),
+        "  ← 现在就在屏幕外" if r.right <= 0 else ""))
+for name in ("window-state.json", "blockers.json"):
+    p = base / name
+    if p.exists():
+        print("残留状态 %s：%s（窗口状态不对时 wx svc stop && wx svc start 会兜底恢复）" %
+              (name, p.read_text(encoding="utf-8")[:110]))
+secs = []
+for f in sorted(glob.glob(str(base / "queue" / "*.result")))[-15:]:
+    try:
+        d = json.loads(pathlib.Path(f).read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, (int, float)) and "front" in k.lower():
+                secs.append(float(v))
+if secs:
+    print("最近 %d 个任务占用的前台时长：平均 %.1fs／最长 %.1fs" %
+          (len(secs), sum(secs) / len(secs), max(secs)))
+PY
+  echo
+  echo "日志：wx svc log 40"
+}
+
 cmd="${1:-}"
 case "$cmd" in
   draft|fill)
@@ -275,6 +394,14 @@ case "$cmd" in
     read_context "$chat" "$n"
     ;;
 
+  peek)
+    peek "${2:-}" "${3:-3}"
+    ;;
+
+  doctor)
+    doctor
+    ;;
+
   resolve)
     kw="${2:-}"
     [ -n "$kw" ] || die "用法：wx resolve \"<关键词>\""
@@ -314,6 +441,6 @@ for x in c:
     ;;
 
   *)
-    die "未知动作 $cmd（可用：draft / send / check / clear / context / resolve / result / svc）"
+    die "未知动作 $cmd（可用：draft / send / check / clear / context / peek / resolve / result / doctor / svc）"
     ;;
 esac

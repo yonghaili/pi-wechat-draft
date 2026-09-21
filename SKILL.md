@@ -31,12 +31,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1   # 建 venv + �
 
 可选：`WX_READER` 指向一个只读微信读取器（能读本地聊天库的 CLI），用于「另链路回读原文」这层证据与口语名字解析。不配置时功能完整，只是少这层证据。
 
-**静默档（建议开）**：`<WX_DIR>/wx-service.env`（每行 `KEY=VALUE`，改完 `wx svc stop && wx svc start`）：`WX_IDLE_GATE=20`（写字动作只在使用者停手 ≥20s 后才动手；默认 2s 会打断他）、`WX_IDLE_GATE_RO=0.5`（只读动作门槛）、`WX_IDLE_FALLBACK=600` / `WX_IDLE_FALLBACK_MIN=5`（等满 10 分钟无长空闲就降级，避免任务饿死）、`WX_IDLE_MAX_WAIT=60`（配合 `--now` 插队）、`WX_RESTORE_BLOCKERS=1`（还原被库最小化的遮挡窗口）。需要立即执行：`wx draft/send ... --now`。
+**静默档（建议开）**：`<WX_DIR>/wx-service.env`（每行 `KEY=VALUE`，改完 `wx svc stop && wx svc start`）：`WX_IDLE_GATE=20`（写字动作只在使用者停手 ≥20s 后才动手；默认 2s 会打断他）、`WX_IDLE_GATE_RO=0.5`（只读动作门槛）、`WX_IDLE_FALLBACK=600` / `WX_IDLE_FALLBACK_MIN=5`（等满 10 分钟无长空闲就降级，避免任务饿死）、`WX_IDLE_MAX_WAIT=60`（配合 `--now` 插队）、`WX_RESTORE_BLOCKERS=1`（还原被库最小化的遮挡窗口）、`WX_OFFSCREEN=1`（任务期间把微信窗口搬到屏幕外）。需要立即执行：`wx draft/send ... --now`。自检用 `wx doctor`（一次列出服务状态、生效配置、两条链路边界、窗口现场与占用基线）。
 
 ## Procedure
 
 1. **确认目标**。口语称呼先用 `wx resolve "<关键词>"` 解析；返回多个候选时**必须问**，不要自己挑（实测同一称呼曾解析出 10 个候选，其中 9 个是零聊天记录的重名联系人）。挑选依据可以是「哪个有近期聊天记录」——用只读读取器逐个查证，而不是猜。
-2. **核对原文**。`wx context "<会话名>" 5`（只读，不碰界面）。看最后一条实质消息是谁发的、在聊什么。涉及时间的草稿（「这就过去」「明天见」）放久了会失效，对不上就重新确认，不要照字面发。
+2. **核对原文**。`wx context "<会话名>" 5` 或 `wx peek "<会话名>"`（两者都只读、不碰界面；`peek` 还会直接告诉“最后一条是我发的还是对方发的、要不要回”）。看最后一条实质消息是谁发的、在聊什么。涉及时间的草稿（「这就过去」「明天见」）放久了会失效，对不上就重新确认，不要照字面发。
 3. **默认只填**。`wx draft "<会话名>" "<文字>"`。服务会：等一次真正的空闲 → 恢复微信窗口（只碰微信自己）→ Alt 键解锁切前台 → 打开会话 → UIA `ValuePattern` 写入 → **逐字回读** → 取消置顶、还原前台窗口与光标 → 写结果文件。
 4. **交付待确认卡片**：会话名、草稿全文、字数、写入方式、控件回读是否一致、**本次占用前台多少秒**。然后明确写「核对无误后自己按回车；或回一句『发』由我发送」。**此时绝不发送。**
 5. **发送（仅在被明确要求时）**。内容与已确认草稿逐字一致才执行 `wx send "<会话名>" "<文字>" --confirm`。使用者只说「发」而内容有变化时，先复述新内容再发。
@@ -53,6 +53,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1   # 建 venv + �
 **上游库会最小化使用者正在用的窗口，而且自己从不还原。** `WeChatGUI._minimize_blockers()`（`guia.py:915`）把所有与微信主窗重叠的其它顶层窗口 `ShowWindow(h, 6)` 最小化。这对库本身是必需的——它用物理点击，窗口被盖住时点击会被覆盖层接走；但它**从不还原**。注意：**`guia.open_chat()` 内部自己会调 `ensure_visible()`**（`guia.py:1306`），所以「调用方不用它的 ensure_visible」并不能避免这件事，必须打补丁。本工具的做法（`wx_service.py` 的 `install_library_patches()` / `restore_library_minimized()`）：保留最小化行为，但把被它最小化的窗口记下来，任务收尾时用库自己的 `_restore_keep_maximize(u32, hwnd)` 还原（会保留最大化状态）；已经不是最小化态的窗口不碰（使用者自己动过就不硬抢）。恢复微信**自己**只用 `ShowWindow(hwnd, SW_SHOW=5 / SW_RESTORE=9)`。
 
 **微信不在前台时，它的无障碍树是空壳。** `chat_input` / `search_box` / `session_list` 全是 `None`，`describe_layout().anchors` 全空。所以「不切前台静默写入」不存在，别在这条路上浪费时间；先切前台再取控件。
+
+**离屏注入（`WX_OFFSCREEN=1`）：任务期间窗口搬出屏幕。** 2026-09-22 用 0.08s 间隔独立采样验证：任务中前台窗口就是微信、矩形停在 `-25600`，屏幕上没有它，写入正常落进输入框。三条硬约束：① 离屏时**强制走无点击的 UIA 路径**（库的点击路径在屏幕外点不到），失败就干净失败；② 搬迁只能用 `SetWindowPos` + `GetWindowRect` 现场校验——`SetWindowPlacement` 改 `rcNormalPosition` 对它无效（最小化中的窗口随后 `SW_RESTORE` 不走那个位置，实测窗口出现在屏幕正中）；③ 搬完**不能再调 `ensure_window_usable`/`SW_RESTORE`**，否则窗口会被拉回屏幕。首尾各有约 0.1–0.25s 露面（微信自己恢复几何 + 最小化动画），物理上绕不过去。
 
 **首选写入方式是 UIA `ValuePattern`（需前台）。** 微信在前台时 `chat_input_field` 是标准 `EditControl`：`GetValuePattern()` 可写可读，`SetValue` 之后回读与写入逐字一致；而且**控件 Name 就是当前会话名**，可以先校验对象再写。这条路径不点击鼠标、不用剪贴板、不注入键盘事件。
 

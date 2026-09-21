@@ -85,6 +85,17 @@ BLOCKERS_STATE = BASE / "blockers.json"    # 被库最小化的窗口句柄（�
 # 打开会话的策略：auto（默认，先走我们的无点击路径、不行再回退库）/ uia（只用无点击路径，
 # 失败就快速失败、绝不进库的级联）/ library（完全恢复成旧行为）。
 OPEN_MODE = (os.environ.get("WX_OPEN_MODE", "auto") or "auto").strip().lower()
+
+# 离屏注入：把微信窗口挪到屏幕外再干活（屏幕上什么都看不到）。
+# 与 2026-09-21 上午被否掉的那版不同：当时打开会话说的是库的物理点击路径（窗口不在屏幕上就点不到），
+# 现在打开会话与写入都改成了 ValuePattern + 回车（**零点击**），只剩“回车要前台”这一条约束，
+# 而窗口挪到屏幕外依然可以是前台 —— 真静默因此成立。
+# 开启后强制走 UIA 打开路径（不回退库的点击路径）、失败就干净失败。
+OFFSCREEN = os.environ.get("WX_OFFSCREEN", "0").strip().lower() not in ("", "0", "false", "no")
+OFFSCREEN_X = int(os.environ.get("WX_OFFSCREEN_X", "-32000"))
+SWP_NOZORDER, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS = 0x0004, 0x0010, 0x0400
+WINDOW_STATE = BASE / "window-state.json"     # 离屏前的原位，供崩溃后兜底搬回
+_OFFSCREEN_ACTIVE = False                     # 本任务是否正在离屏（供 Gui.open 判断）
 # 发送前的确定性敏感词闸门（本地、离线，不依赖网络与模型）。
 # 为什么单独硬拦这一层：金额与凭证发出去是不可逆的（发错账户/泄露验证码），
 # 所以在这一步做一次确定性硬拦。只拦「客观危险」的两类（金额与凭证）；
@@ -99,15 +110,31 @@ HIGH_RISK_PATTERNS = (
 )
 POLL = 0.4
 
-# 本工具不做「把微信窗口搬到屏幕外/改几何」这类“真静默”（2026-09-21 实测否定）：
-#   ① 库用 uiautomation 的 Control.Click() 打开会话，而它是 SetCursorPos +
-#      mouse_event 的物理点击；窗口一旦不在屏幕上，点击坐标就无效，打开会话必然失败；
-#   ② 库自己会在任务中改写窗口几何与其它窗口的可见性（guia.py 的 _minimize_blockers、
-#      _restore_keep_maximize），外部“记住原位再还原”不可靠，反而会把窗口挪到别处。
-# 所以静默只能靠“时机”：只在使用者长时间空闲时才动手（WX_IDLE_GATE）。
+# 关于“真静默（把窗口挪到屏幕外）”，两次实测的结论正好相反，以 2026-09-22 为准：
+#   2026-09-21 否定——当时打开会话说的是库的物理点击路径（SetCursorPos + mouse_event），
+#     窗口不在屏幕上就点不到；而且库自己会改写窗口几何，外部“记原位再还原”不可靠。
+#   2026-09-22 推翻——打开会话与写入都改成了 ValuePattern + 回车（零点击），只剩“回车要前台”
+#     这一条约束，而窗口即使在屏幕外也能是前台 → 离屏注入成立（WX_OFFSCREEN=1，实测写入落在
+#     输入框、且前台窗口的屏幕矩形在 -32000）。但仍有两条硬约束：
+#       ① 离屏期间必须走无点击路径，所以强制不回退库的点击级联（Gui.open 里看 _OFFSCREEN_ACTIVE）；
+#       ② 不能用 SetWindowPlacement 改 rcNormalPosition 来“搬”——最小化中的窗口随后
+#          SW_RESTORE 不走那个位置（实测任务期间窗口出现在 (0,0)+1305x828，屏幕上看得到）。
+#          必须先 SW_RESTORE 再 SetWindowPos 直搬，并用 GetWindowRect 现场校验。
+# 时机闸门（WX_IDLE_GATE）仍保留：它管的是“什么时候动手”，与“动手时能不能被看见”是两件事。
 
 u32 = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
+
+# 显式声明原型：64 位下句柄按默认 c_int 传会被截断（本文件 2026-09-21 已踩过一次）。
+u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+u32.GetWindowRect.restype = wintypes.BOOL
+u32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, wintypes.UINT]
+u32.SetWindowPos.restype = wintypes.BOOL
+u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+u32.ShowWindow.restype = wintypes.BOOL
+u32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.c_void_p]
+u32.SetWindowPlacement.argtypes = [wintypes.HWND, ctypes.c_void_p]
 
 
 def log(msg: str) -> None:
@@ -271,6 +298,142 @@ def ensure_window_usable() -> str:
         time.sleep(0.5)
         return "restored_from_tray"
     return "ok"
+
+
+# ------------------------------------------------ 离屏注入（真静默）与位置还原
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", wintypes.UINT), ("flags", wintypes.UINT),
+                ("showCmd", wintypes.UINT), ("ptMinPosition", POINT),
+                ("ptMaxPosition", POINT), ("rcNormalPosition", wintypes.RECT),
+                ("rcDevice", wintypes.RECT)]
+
+
+def _get_placement(hwnd: int):
+    wp = WINDOWPLACEMENT()
+    wp.length = ctypes.sizeof(wp)
+    if not u32.GetWindowPlacement(wintypes.HWND(hwnd), ctypes.byref(wp)):
+        return None
+    return wp
+
+
+def _placement_dict(wp) -> dict:
+    r = wp.rcNormalPosition
+    return {"showCmd": int(wp.showCmd),
+            "normal": [int(r.left), int(r.top), int(r.right), int(r.bottom)]}
+
+
+# 注意：**不要**用 SetWindowPlacement 改 rcNormalPosition 来“搬窗口”——最小化中的窗口
+# 随后 SW_RESTORE 不走那个位置（2026-09-22 实测：任务期间窗口照样出现在屏幕正中）。
+# 该 API 本文件已不再使用；搬迁一律 SetWindowPos + GetWindowRect 现场校验。
+
+
+def _window_rect(hwnd: int):
+    r = wintypes.RECT()
+    if not u32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(r)):
+        return None
+    return [int(r.left), int(r.top), int(r.right), int(r.bottom)]
+
+
+def _is_offscreen(rect) -> bool:
+    """右边界 ≤ 0 才算“屏幕上完全看不到”。
+
+    注意：Windows 会把窗口位置夹到 -25600（不是 -32000），所以**不能拿 OFFSCREEN_X 比对**，
+    否则会把真正成功的离屏误判为失败（2026-09-22 踩到）。
+    """
+    return bool(rect) and rect[2] <= 0
+
+
+def _go_offscreen(hwnd: int):
+    """把微信窗口挪到屏幕外（屏幕上什么都看不到），返回还原信息；搬不动则返回 None。
+
+    实测教训（2026-09-22）：**不能用 SetWindowPlacement 改 rcNormalPosition 来搬**——
+    窗口处于最小化时，随后的 ShowWindow(SW_RESTORE) 不走那个位置，任务期间窗口照样
+    出现在屏幕正中（采样实测 (0,0)+1305x828）。正确做法：
+      ① 最小化时先对“最小化的窗口”SetWindowPos（它会写进恢复位置），再 SW_RESTORE；
+         若恢复位置没跟着走，才退回“先恢复再搬”（代价是屏幕上一瞬间可见）；
+      ② 每次都用 GetWindowRect 现场校验，没搬动就放弃离屏——宁可被看见，
+         也不能把无点击路径弄成不可用。
+    """
+    wp = _get_placement(hwnd)
+    if not wp:
+        return None
+    cur = _placement_dict(wp)
+    r = cur["normal"]
+    w, h = max(1, r[2] - r[0]), max(1, r[3] - r[1])
+    minimized = int(wp.showCmd) == 2
+    swp = SWP_NOZORDER | SWP_NOACTIVATE
+    if not u32.IsWindowVisible(wintypes.HWND(hwnd)) and not minimized:
+        u32.ShowWindow(wintypes.HWND(hwnd), 8)           # 托盘/隐藏状态：先显形（不抢焦点）
+        time.sleep(0.2)
+    if minimized:
+        # 先让微信自己恢复完（Qt 会把自己的缓存几何应用上），**随后**再搬。
+        # 反过来（先搬再 SW_SHOWNA）实测不行：应用会在我们搬完之后自己把窗口
+        # 恢复到 (1297,243) 盖掉我们的位置（2026-09-22 用 0.08s 采样器抓到）。
+        u32.ShowWindow(wintypes.HWND(hwnd), 9)           # SW_RESTORE
+        time.sleep(0.25)
+    rect = _window_rect(hwnd)
+    if rect:
+        w, h = max(1, rect[2] - rect[0]), max(1, rect[3] - rect[1])
+    # 收敛循环：应用有时会把窗口抢回原位，搬完复检，最多试三拍。
+    for i in range(3):
+        u32.SetWindowPos(wintypes.HWND(hwnd), None, OFFSCREEN_X, 0, w, h, swp)
+        time.sleep(0.18)
+        rect = _window_rect(hwnd)
+        if _is_offscreen(rect):
+            break
+        time.sleep(0.12)
+    if not _is_offscreen(rect):
+        log(f"  [离屏] 搬窗口失败（实际 {rect}），本次按普通模式执行")
+        if minimized:
+            u32.ShowWindow(wintypes.HWND(hwnd), 7)      # 还回最小化
+        return None
+    try:
+        WINDOW_STATE.write_text(json.dumps({"hwnd": int(hwnd), **cur}), encoding="utf-8")
+    except Exception:
+        pass
+    return cur
+
+
+def _restore_placement(hwnd: int, cur: dict) -> None:
+    """把窗口搬回原位并恢复原显示状态；全程先隐藏，避免搬回去的路上在屏幕上露面。"""
+    if cur:
+        r = cur["normal"]
+        w, h = max(1, r[2] - r[0]), max(1, r[3] - r[1])
+        u32.ShowWindow(wintypes.HWND(hwnd), 0)          # SW_HIDE
+        time.sleep(0.1)
+        u32.SetWindowPos(wintypes.HWND(hwnd), None, r[0], r[1], w, h,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+        time.sleep(0.12)
+        sc = int(cur.get("showCmd", 1))
+        if sc == 2:
+            u32.ShowWindow(wintypes.HWND(hwnd), 7)      # 恢复成最小化，且不抢焦点
+        elif sc == 3:
+            u32.ShowWindow(wintypes.HWND(hwnd), 3)      # SW_MAXIMIZE
+        else:
+            u32.ShowWindow(wintypes.HWND(hwnd), 8)      # SW_SHOWNA
+    try:
+        WINDOW_STATE.unlink()
+    except Exception:
+        pass
+
+
+def _recover_window_state() -> None:
+    """启动兜底：上次离屏后进程被杀，把窗口搬回原位。"""
+    if not WINDOW_STATE.exists():
+        return
+    try:
+        d = json.loads(WINDOW_STATE.read_text(encoding="utf-8"))
+        hwnd = int(d["hwnd"])
+        if u32.IsWindow(wintypes.HWND(hwnd)):
+            _restore_placement(hwnd, {"showCmd": int(d.get("showCmd", 1)), "normal": d["normal"]})
+            log(f"  启动兜底：微信窗口已从屏幕外搬回 {d['normal']}")
+            return
+    except Exception as e:
+        log(f"  窗口位置兜底恢复失败: {e}")
+    try:
+        WINDOW_STATE.unlink()
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ OCR（复核）
@@ -483,8 +646,9 @@ class Gui:
                 log(f"  打开会话 {chat}：UIA 路径（{how}）{time.time()-t0:.1f}s")
                 mark(f"打开会话 {chat}", t0)
                 return True
-            if OPEN_MODE == "uia":
-                log(f"  UIA 路径未成功（{time.time()-t0:.1f}s），WX_OPEN_MODE=uia → 不进库的级联")
+            if OPEN_MODE == "uia" or _OFFSCREEN_ACTIVE:
+                log(f"  UIA 路径未成功（{time.time()-t0:.1f}s），"
+                    f"{'离屏模式' if _OFFSCREEN_ACTIVE else 'WX_OPEN_MODE=uia'} → 不进库的点击级联")
                 mark(f"打开会话 {chat}", t0)
                 return False
             log(f"  UIA 路径未成功（{time.time()-t0:.1f}s），回退库的 open_chat")
@@ -1271,7 +1435,25 @@ def run_job(job) -> dict:
     started = time.time()
     prev_fg = foreground_window()
     prev_cursor = cursor_pos()
-    state = ensure_window_usable()
+    # 离屏注入：先把窗口挪到屏幕外，再让它在前台干活 —— 屏幕上什么都看不到。
+    global _OFFSCREEN_ACTIVE
+    hwnd_wx = 0
+    saved_pl = None
+    if OFFSCREEN:
+        _info = wechat_main_window()
+        hwnd_wx = _info[0] if _info else 0
+        if hwnd_wx:
+            saved_pl = _go_offscreen(hwnd_wx)
+            _OFFSCREEN_ACTIVE = bool(saved_pl)
+            if not saved_pl:
+                log("  [离屏] 挪窗口失败，本次按普通模式执行")
+    if saved_pl:
+        # 已在屏幕外且可见：**不能**再调 ensure_window_usable（它会 SW_RESTORE，把窗口拉回屏幕）。
+        state = "offscreen"
+        log(f"  [离屏] 微信窗口 hwnd={hwnd_wx} 已在屏幕外 x={OFFSCREEN_X}"
+            f"（原位 {saved_pl['normal']}，showCmd={saved_pl['showCmd']}）")
+    else:
+        state = ensure_window_usable()
     gui.note_front()
     mark("窗口准备", started)
     log(f"[{job['id']}] {action} chat={job.get('chat')!r} window={state} "
@@ -1293,7 +1475,14 @@ def run_job(job) -> dict:
     res["seconds"] = round(time.time() - started, 1)
     res["foreground_seconds"] = (round(time.time() - gui.front_started, 1)
                                  if gui.front_started else 0)
-    # 收尾还原：上游库最小化的遮挡窗口 → 取消置顶 → 光标 → 原前台窗口
+    # 收尾还原：窗口位置（离屏）→ 上游库最小化的遮挡窗口 → 取消置顶 → 光标 → 原前台窗口
+    try:
+        if saved_pl and hwnd_wx and u32.IsWindow(wintypes.HWND(hwnd_wx)):
+            _restore_placement(hwnd_wx, saved_pl)
+            log(f"  [离屏] 微信窗口已搬回原位 {saved_pl['normal']}")
+        _OFFSCREEN_ACTIVE = False
+    except Exception as e:
+        log(f"  窗口位置还原异常: {e}")
     try:
         res["blockers_restored"] = restore_library_minimized()
     except Exception as e:
@@ -1324,6 +1513,7 @@ def main() -> int:
     PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
     install_library_patches()        # 给上游库的“最小化遮挡窗口”行为打补丁
     recover_blockers()               # 兜底：上次进程被杀遗留的被最小化窗口
+    _recover_window_state()          # 兜底：上次离屏后被杀，把微信窗口搬回原位
     idle_ok = idle_detector_usable(need=2.0, samples=20, interval=0.3)
     gate = IDLE_GATE                 # 闸门始终生效：只在真正空闲时才动手
     log(f"服务启动 pid={os.getpid()} idle_gate={gate}s")
