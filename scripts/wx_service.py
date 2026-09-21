@@ -81,6 +81,7 @@ IDLE_FALLBACK = float(os.environ.get("WX_IDLE_FALLBACK", "600"))
 IDLE_FALLBACK_MIN = float(os.environ.get("WX_IDLE_FALLBACK_MIN", "5"))
 # 任务收尾时把上游库为了“让路”而最小化的遮挡窗口还原（推荐开）
 RESTORE_BLOCKERS = os.environ.get("WX_RESTORE_BLOCKERS", "1").strip().lower() not in ("", "0", "false", "no")
+BLOCKERS_STATE = BASE / "blockers.json"    # 被库最小化的窗口句柄（进程被杀后启动时兜底恢复）
 # 发送前的确定性敏感词闸门（本地、离线，不依赖网络与模型）。
 # 为什么单独硬拦这一层：金额与凭证发出去是不可逆的（发错账户/泄露验证码），
 # 所以在这一步做一次确定性硬拦。只拦「客观危险」的两类（金额与凭证）；
@@ -135,7 +136,11 @@ def idle_seconds() -> float:
 
 
 def foreground_window() -> int:
-    return int(u32.GetForegroundWindow())
+    # 注意：上游库会修改共享的 windll.user32 函数原型（restype），此时
+    # GetForegroundWindow() 在没有前台窗口时返回的是 **None** 而不是 0，
+    # 直接 int() 会抛 “int() argument must be ... not 'NoneType'” 并把整个任务打挂
+    # （2026-09-21 实际踩到两次，traceback 落在 require_front → is_front）。
+    return int(u32.GetForegroundWindow() or 0)
 
 
 def cursor_pos():
@@ -626,6 +631,53 @@ _LIB_MINIMIZED: list[int] = []
 _PATCHED = False
 
 
+def _persist_blockers() -> None:
+    """把“被库最小化的窗口”落盘：服务若在任务中途被杀，那些窗口不该永远留在最小化态。"""
+    try:
+        BLOCKERS_STATE.write_text(json.dumps(_LIB_MINIMIZED), encoding="utf-8")
+    except Exception as e:
+        log(f"  记录遮挡窗口失败（不影响本次任务）: {e}")
+
+
+def clear_blockers_state() -> None:
+    try:
+        BLOCKERS_STATE.unlink()
+    except Exception:
+        pass
+
+
+def recover_blockers() -> int:
+    """服务启动时的兜底：上次进程被杀时被库最小化的窗口，能还原的还原。"""
+    if not BLOCKERS_STATE.exists():
+        return 0
+    try:
+        hwnds = json.loads(BLOCKERS_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        clear_blockers_state()
+        return 0
+    try:
+        from wechatauto import guia
+        restore_one = getattr(guia, "_restore_keep_maximize", None)
+    except Exception:
+        restore_one = None
+    n = 0
+    for h in (hwnds if isinstance(hwnds, list) else []):
+        try:
+            if not u32.IsWindow(wintypes.HWND(h)) or not u32.IsIconic(wintypes.HWND(h)):
+                continue
+            if restore_one is not None:
+                restore_one(u32, h)
+            else:
+                u32.ShowWindow(wintypes.HWND(h), 9)      # SW_RESTORE
+            n += 1
+        except Exception:
+            pass
+    clear_blockers_state()
+    if n:
+        log(f"  启动兜底：已还原上次遗留的被最小化窗口 {n} 个")
+    return n
+
+
 def install_library_patches() -> None:
     """给 wechatauto 的“最小化遮挡窗口”行为打进程内补丁（不修改 site-packages）。"""
     global _PATCHED
@@ -655,6 +707,8 @@ def install_library_patches() -> None:
         for h in before - _visible_set():
             if h not in _LIB_MINIMIZED:
                 _LIB_MINIMIZED.append(h)
+        if _LIB_MINIMIZED:
+            _persist_blockers()
         return n
 
     cls._minimize_blockers = patched
@@ -689,6 +743,7 @@ def restore_library_minimized() -> int:
             log(f"  还原遮挡窗口 {h} 失败: {e}")
     if n:
         log(f"  已还原被库最小化的遮挡窗口 {n} 个")
+    clear_blockers_state()
     return n
 
 
@@ -755,6 +810,8 @@ def act_check(gui: Gui, job) -> dict:
 
 def act_draft(gui: Gui, job) -> dict:
     chat, text = job["chat"], job.get("text", "")
+    # 草稿路径不拦（草稿本来就要使用者核对），但把命中敏感类别的草稿在卡片上提醒一行
+    hits = high_risk_hits(text)
     ctx = read_context(chat, 3)          # 慢活（reader，不碰界面）放在抢焦点之前
     if not gui.require_front():
         return {"ok": False, "error": "微信未能切到前台（可能你正在操作别的窗口），本次未输入"}
@@ -769,6 +826,7 @@ def act_draft(gui: Gui, job) -> dict:
     mark("ValuePattern 直写+回读", _t)
     if ok and gui.chat_name_matches(ctrl_chat, chat):
         return {"ok": True, "method": "value_pattern", "readback": back,
+                "high_risk": hits,
                 "evidence": {"chat": chat, "text": text, "chars": len(text),
                              "ctrl_chat_name": ctrl_chat, "context": ctx}}
     if ctrl_chat and not gui.chat_name_matches(ctrl_chat, chat):
@@ -1099,6 +1157,7 @@ def main() -> int:
             pass
     PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
     install_library_patches()        # 给上游库的“最小化遮挡窗口”行为打补丁
+    recover_blockers()               # 兜底：上次进程被杀遗留的被最小化窗口
     idle_ok = idle_detector_usable(need=2.0, samples=20, interval=0.3)
     gate = IDLE_GATE                 # 闸门始终生效：只在真正空闲时才动手
     log(f"服务启动 pid={os.getpid()} idle_gate={gate}s")

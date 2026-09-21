@@ -61,6 +61,18 @@ Write-Host "verifying imports..." -ForegroundColor Cyan
 $svc = Join-Path $here 'scripts\wx_service.py'
 & $py -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read()); print('wx_service.py parses OK')" $svc
 
+# --- runtime config template -------------------------------------------------
+# The silent-mode preferences live in <repo>/wx-service.env (same dir as this script,
+# because that is the default WX_DIR). Ship a commented template; never overwrite.
+$envTpl  = Join-Path $here 'wx-service.env.example'
+$envFile = Join-Path $here 'wx-service.env'
+if ((Test-Path $envTpl) -and -not (Test-Path $envFile)) {
+    Copy-Item -LiteralPath $envTpl -Destination $envFile
+    Write-Host "wrote runtime config: wx-service.env (quiet defaults)" -ForegroundColor Cyan
+} elseif (Test-Path $envFile) {
+    Write-Host "runtime config already exists, left as is: wx-service.env"
+}
+
 Write-Host ""
 Write-Host "Done." -ForegroundColor Green
 Write-Host ""
@@ -76,3 +88,4 @@ Write-Host "     wx svc start        # start the background service"
 Write-Host "     wx svc status       # should say: running pid=..."
 Write-Host ""
 Write-Host "Read SKILL.md for the full workflow and the pitfalls that matter."
+Write-Host "Tune behaviour in wx-service.env (idle gate, fallback, blocker restore)."

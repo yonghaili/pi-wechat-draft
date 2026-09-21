@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """微信 4.x 会话操作封装：只填不发 / 发送 / 清空输入框。
 
+⚠️ 排障专用直连命令，日常请用 `wx draft/send/check/clear`。
+
+它**不经过后台服务**，因此没有静默档（会直接抢前台）、没有敏感内容闸门、没有“不写入错会话”
+的现场核对，也**没有遮挡窗口还原补丁**——直接调用上游库时，库会把挡着微信的其它窗口最小化
+而且不还原（见 wx_service.py 里的 install_library_patches）。只在你明确要做最底层排障时用它。
+
 依赖 wechatauto-replica（装在 ~/.pi/wechat-ui/venv）。
 用法：
     python wx_task.py fill  <会话名> <文字>   # 只填入输入框，绝不发送

@@ -144,6 +144,8 @@ if d.get("error"): print("说明：%s" % d["error"])
 if d.get("hint"): print("提示：%s" % d["hint"])
 if d.get("method"): print("写入方式：%s" % d["method"])
 if d.get("readback") is not None: print("控件回读：%r" % d["readback"])
+if d.get("high_risk"):
+    print("⚠ 提醒：这段草稿含 %s——发给别人前请逐字核对（这层只在 wx send 上硬拦）" % "、".join(d["high_risk"]))
 if d.get("input_row") is not None: print("输入行：%s" % (d["input_row"] or "（空）"))
 if d.get("filled_flag") is not None: print("库返回 filled：%s" % d["filled_flag"])
 if ev.get("opened") is not None: print("会话已开：%s" % ev["opened"])
