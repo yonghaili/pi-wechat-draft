@@ -80,6 +80,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1   # 建 venv + �
 
 ⚠️ **这层只覆盖 `wx send`。** 使用者自己在输入框按回车发送不经过任何服务端检查；所以草稿阶段的逐字核对不能省。
 
+## 打开会话（无点击路径）
+
+默认 `WX_OPEN_MODE=auto`：先读当前输入框控件的会话名（便宜版），已是目标直接用；否则 UIA `ValuePattern` 直写搜索框 → 纯 UIA 读结果列表并确认**第一条结果就是目标** → `SetFocus` + 回车 → 现场校验会话名。实测打开 **2.4-2.6s**、不点鼠标、不用剪贴板、不跑 OCR，也不会把使用者的窗口最小化；失败才回退上游库的 `open_chat`（`=uia` 则绝不回退，快速失败）。
+
+别重复走这两条死路：搜索结果项用 `Invoke`/`SelectionItem` 打开（会开成**独立聊天窗口**，主窗输入框不变）；侧栏列表项 `Select()`/`Invoke()`（**切不动会话**，白等 2.4s；而且虚拟列表看不到非置顶会话、没有 UIA 滚动）。
+
 ## Verification
 
 1. **填入后**：结果里 `写入方式: value_pattern`，`控件回读` 与草稿一致，`控件所属会话名` == 目标会话；同时聊天区**不应**出现新气泡（`wx context` 最后一条仍是旧消息）。

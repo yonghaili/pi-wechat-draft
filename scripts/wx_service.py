@@ -82,6 +82,9 @@ IDLE_FALLBACK_MIN = float(os.environ.get("WX_IDLE_FALLBACK_MIN", "5"))
 # 任务收尾时把上游库为了“让路”而最小化的遮挡窗口还原（推荐开）
 RESTORE_BLOCKERS = os.environ.get("WX_RESTORE_BLOCKERS", "1").strip().lower() not in ("", "0", "false", "no")
 BLOCKERS_STATE = BASE / "blockers.json"    # 被库最小化的窗口句柄（进程被杀后启动时兜底恢复）
+# 打开会话的策略：auto（默认，先走我们的无点击路径、不行再回退库）/ uia（只用无点击路径，
+# 失败就快速失败、绝不进库的级联）/ library（完全恢复成旧行为）。
+OPEN_MODE = (os.environ.get("WX_OPEN_MODE", "auto") or "auto").strip().lower()
 # 发送前的确定性敏感词闸门（本地、离线，不依赖网络与模型）。
 # 为什么单独硬拦这一层：金额与凭证发出去是不可逆的（发错账户/泄露验证码），
 # 所以在这一步做一次确定性硬拦。只拦「客观危险」的两类（金额与凭证）；
@@ -440,11 +443,51 @@ class Gui:
         except Exception:
             return None
 
+    def current_chat_raw(self):
+        """便宜版现场读会话名：直接读输入框控件的 Name，不做 is_materialized 深检。
+
+        实测 `current_chat_live()` 的深检每次约 1.5s，而“打开会话”路径上要查两次——
+        这就是打开动作从 2.7s 变成 6s 的差额。这里只读控件名，代价是控件未物化时
+        可能返回 None；调用方把 None 当“未确认”处理即可（真正的安全闸门是写入时
+        对控件会话名的核对，不靠这个读）。
+        """
+        try:
+            import uiautomation as auto
+            aid = "chat_input_field"
+            try:
+                from wechatauto.uia_driver import CHAT_INPUT_AID as aid  # noqa: F811
+            except Exception:
+                pass
+            win = auto.WindowControl(searchDepth=1, ClassName="mmui::MainWindow")
+            if not win.Exists(1):
+                return None
+            e = win.EditControl(AutomationId=aid)
+            return (e.Name or None) if e.Exists(0.3) else None
+        except Exception:
+            return None
+
     def open(self, chat: str) -> bool:
         t0 = time.time()
-        if self.current_chat_live() == chat:      # 现场核对，不信任缓存
+        _cur = self.current_chat_raw()
+        if _cur and Gui.chat_name_matches(_cur, chat):   # 现场核对，不信任缓存
             self._chat = chat
             return True
+        if OPEN_MODE in ("auto", "uia"):
+            try:
+                how = open_chat_uia(chat)
+            except Exception as e:                    # 无点击路径任何异常都不得让任务失败
+                log(f"  UIA 打开路径异常（{e}）")
+                how = ""
+            if how:
+                self._chat = chat
+                log(f"  打开会话 {chat}：UIA 路径（{how}）{time.time()-t0:.1f}s")
+                mark(f"打开会话 {chat}", t0)
+                return True
+            if OPEN_MODE == "uia":
+                log(f"  UIA 路径未成功（{time.time()-t0:.1f}s），WX_OPEN_MODE=uia → 不进库的级联")
+                mark(f"打开会话 {chat}", t0)
+                return False
+            log(f"  UIA 路径未成功（{time.time()-t0:.1f}s），回退库的 open_chat")
         ok = bool(self.get().open_chat(chat))
         live = self.current_chat_live()
         if ok and (live is None or live == chat):
@@ -935,6 +978,129 @@ def duplicate_send_guard(last_msgs, text: str, force: bool):
 def high_risk_hits(text: str) -> list:
     """返回文本命中的高风险类别（本地正则，不联网）。"""
     return [label for pat, label in HIGH_RISK_PATTERNS if pat.search(text or "")]
+
+
+def open_chat_uia(chat: str) -> str:
+    """无点击打开会话：搜索框 UIA `ValuePattern` 直写 + 回车。
+
+    返回 "already" / "search" / ""（未成功，调用方决定是否回退库的路径）。
+
+    为什么比库的路径可靠（2026-09-21 实测）：库走的是“点击搜索框 + 剪贴板 Ctrl+V +
+    SendKeys + 点击搜索结果项”，三个易碎环节，而且它为此必须先把挡着微信的窗口
+    **最小化**（`_minimize_blockers`）；失败时还会进入无超时的级联（实测同一会话
+    一次 63.5s 失败、下一次 4.3s 成功）。这里全程 UIA 写值 + 键盘回车：不点鼠标、
+    不用剪贴板、不跑 OCR，也不触发最小化。
+
+    为什么不用侧栏列表项：侧栏虽然能用 UIA 枚举（`session_item_<会话名>`），但实测
+    `SelectionItem.Select()` / `Invoke()` **不能真正切换会话**（等 2.4s 白费），而且
+    它是虚拟列表、看不到非置顶会话、也没有 UIA 滚动。所以侧栏这条只用于“是否已打开”
+    的判断，真正的打开动作全靠搜索框。
+    """
+    if Gui.chat_name_matches(GUI.current_chat_raw(), chat):
+        return "already"
+    try:
+        import uiautomation as auto
+    except Exception as e:
+        log(f"  UIA 打开路径不可用（{e}）")
+        return ""
+    # 常量优先用上游库的（它是权威），拿不到就用本地回退值——库改了也不至于全挂
+    try:
+        from wechatauto.uia_driver import (CHAT_INPUT_AID, SEARCH_EDIT_CLASSES,
+                                           SEARCH_EDIT_NAME, SEARCH_LIST_AIDS)
+    except Exception:
+        CHAT_INPUT_AID = "chat_input_field"
+        SEARCH_EDIT_CLASSES = ("mmui::XValidatorTextEdit",)
+        SEARCH_EDIT_NAME = "搜索"
+        SEARCH_LIST_AIDS = ("search_result_list",)
+    try:
+        win = auto.WindowControl(searchDepth=1, ClassName="mmui::MainWindow")
+        if not win.Exists(3):
+            return ""
+    except Exception:
+        return ""
+    box_in = win.EditControl(AutomationId=CHAT_INPUT_AID)
+
+    def live():
+        return box_in.Name if box_in.Exists(0.3) else None
+
+    # ② 搜索框直写 + 回车。不点鼠标、不粘剪贴板。
+    box = None
+    for cls in SEARCH_EDIT_CLASSES:
+        for kw in (dict(ClassName=cls, Name=SEARCH_EDIT_NAME),
+                   dict(Name=SEARCH_EDIT_NAME), dict(ClassName=cls)):
+            e = win.EditControl(**kw)
+            if e.Exists(0.6, 0.15):
+                box = e
+                break
+        if box is not None:
+            break
+    if box is None:
+        return ""
+    try:
+        vp = box.GetValuePattern()
+        if vp is None:
+            return ""
+        vp.SetValue("")
+        time.sleep(0.15)
+        vp.SetValue(chat)
+    except Exception as e:
+        log(f"  搜索框直写失败（{e}）")
+        return ""
+
+    # 结果列表用纯 UIA 直接读（不经库的 _collect_results）：那条路每次内部要花 3 秒找列表，
+    # 而且会构造 WeChatGUI → 触发它「最小化遮挡窗口」。分步实测：整段 2.65s，其中直写搜索框占 1.18s。
+    def first_result_name():
+        for aid in SEARCH_LIST_AIDS:
+            try:
+                lst_ = auto.ListControl(searchDepth=0xFFFFFFFF, AutomationId=aid)
+            except Exception:
+                continue
+            if not lst_.Exists(0.2, 0.1):
+                continue
+            try:
+                for k in lst_.GetChildren():
+                    if not (k.AutomationId or ""):      # 无 aid 的行是分组标题（“最常使用”等）
+                        continue
+                    return (k.Name or "").strip()
+            except Exception:
+                continue
+        return None
+
+    # 只有确认“第一条结果就是目标”才敢回车——开错会话比打不开更糟。
+    exact = False
+    deadline = time.time() + 6.0
+    while time.time() < deadline:
+        first = first_result_name()
+        if first:
+            exact = Gui.chat_name_matches(first, chat)
+            break
+        time.sleep(0.15)
+    if not exact:
+        log("  搜索结果第一条不是目标会话 → 不回车（避免开错会话）")
+        try:
+            vp.SetValue("")
+        except Exception:
+            pass
+        return ""
+    try:
+        box.SetFocus()
+    except Exception:
+        pass
+    auto.SendKeys("{Enter}", waitTime=0.1)
+    for _ in range(16):
+        time.sleep(0.25)
+        if Gui.chat_name_matches(live(), chat):
+            try:
+                vp.SetValue("")          # 清搜索框，避免残留影响下一次
+            except Exception:
+                pass
+            return "search"
+    log("  回车后现场读到的不是目标会话")
+    try:
+        vp.SetValue("")
+    except Exception:
+        pass
+    return ""
 
 
 def act_send(gui: Gui, job) -> dict:
