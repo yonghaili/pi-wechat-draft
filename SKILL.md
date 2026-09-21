@@ -80,7 +80,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1   # 建 venv + �
 
 ⚠️ **这层只覆盖 `wx send`。** 使用者自己在输入框按回车发送不经过任何服务端检查；所以草稿阶段的逐字核对不能省。
 
-**第二层·判断层（可选，TypeSafe Jev）**：交付确认卡片前跑：
+**第二层·判断层（可选，TypeSafe Jev）**：**只在「让助手起草 / 给建议」这条路径上用**——使用者要你说回什么时，选择本来就归他，Jev 的排序与「对方真正需要什么」是帮他省事的一个意见。**使用者已经口述了具体文本时不要跑**（实测同一批候选里 Jev 把他自己选的那条排到过 0.04，置信 0.38；拿它去质疑他的措辞是本末倒置）：
 
 ```bash
 python scripts/jev_advise.py --chat "<会话名>" --text "<拟发文本>" --relationship "<关系描述>"
