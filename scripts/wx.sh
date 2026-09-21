@@ -106,7 +106,7 @@ print("最近一次：%s %s → ok=%s %s" % (last.get("action"), last.get("chat"
 
 # ------------------------------------------------------------------ 提交任务
 submit() {
-  local action="$1" chat="$2" text="${3:-}" confirm="${4:-0}" force="${5:-0}" immediate="${6:-0}"
+  local action="$1" chat="$2" text="${3:-}" confirm="${4:-0}" force="${5:-0}" immediate="${6:-0}" allowhr="${7:-0}"
   svc_start || return 1
   mkdir -p "$QUEUE"
   local id seq
@@ -118,8 +118,9 @@ job=dict(zip(("id","action","chat","text","confirm","created"),
              (sys.argv[2],sys.argv[3],sys.argv[4],sys.argv[5],sys.argv[6]=="1",sys.argv[7])))
 job["force"] = (len(sys.argv) > 8 and sys.argv[8] == "1")
 job["immediate"] = (len(sys.argv) > 9 and sys.argv[9] == "1")
+job["allow_high_risk"] = (len(sys.argv) > 10 and sys.argv[10] == "1")
 open(sys.argv[1],"w",encoding="utf-8").write(json.dumps(job,ensure_ascii=False))
-' "$QUEUE/$seq.$id.job" "$id" "$action" "$chat" "$text" "$confirm" "$(date +%Y-%m-%dT%H:%M:%S)" "$force" "$immediate"
+' "$QUEUE/$seq.$id.job" "$id" "$action" "$chat" "$text" "$confirm" "$(date +%Y-%m-%dT%H:%M:%S)" "$force" "$immediate" "$allowhr"
   local start; start=$(date +%s)
   echo "任务号：$id"
   while [ ! -f "$QUEUE/$id.result" ]; do
@@ -233,12 +234,13 @@ case "$cmd" in
     ;;
 
   send)
-    chat="${2:-}"; text="${3:-}"; confirm="${4:-}"; force=0; now=0
+    chat="${2:-}"; text="${3:-}"; confirm="${4:-}"; force=0; now=0; allowhr=0
     for a in "$@"; do
       [ "$a" = "--force" ] && force=1
       [ "$a" = "--now" ] && now=1
+      [ "$a" = "--allow-high-risk" ] && allowhr=1
     done
-    [ -n "$chat" ] && [ -n "$text" ] || die "用法：wx send \"<会话名>\" \"<文字>\" --confirm [--force] [--now]"
+    [ -n "$chat" ] && [ -n "$text" ] || die "用法：wx send \"<会话名>\" \"<文字>\" --confirm [--force] [--now] [--allow-high-risk]"
     if [ "$confirm" != "--confirm" ] && [ "${WX_SEND_CONFIRMED:-}" != "1" ]; then
       echo "已阻止发送：send 需要显式确认。"
       echo "  默认请用：wx draft \"$chat\" \"$text\""
@@ -246,7 +248,7 @@ case "$cmd" in
       exit 9
     fi
     echo "已提交后台服务（会真的发出；若最近一条已是同内容会被拦下，需 --force 才强行重发）…"
-    submit send "$chat" "$text" 1 "$force" "$now"
+    submit send "$chat" "$text" 1 "$force" "$now" "$allowhr"
     exit $?
     ;;
 

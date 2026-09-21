@@ -81,6 +81,18 @@ IDLE_FALLBACK = float(os.environ.get("WX_IDLE_FALLBACK", "600"))
 IDLE_FALLBACK_MIN = float(os.environ.get("WX_IDLE_FALLBACK_MIN", "5"))
 # 任务收尾时把上游库为了“让路”而最小化的遮挡窗口还原（推荐开）
 RESTORE_BLOCKERS = os.environ.get("WX_RESTORE_BLOCKERS", "1").strip().lower() not in ("", "0", "false", "no")
+# 发送前的确定性敏感词闸门（本地、离线，不依赖网络与模型）。
+# 为什么单独硬拦这一层：金额与凭证发出去是不可逆的（发错账户/泄露验证码），
+# 所以不能只靠“判断层提醒”。只拦「客观危险」两类；承诺/时间类不拦——那是日常
+# 沟通的常态，交给 Jev 判断层提醒（见 scripts/jev_advise.py）。
+# 确实要照发必须显式加 --allow-high-risk（会记日志）。
+HIGH_RISK_PATTERNS = (
+    (re.compile(r"\b\d{16,19}\b"), "16-19 位长数字（银行卡/账号）"),
+    (re.compile(r"验证码|校验码|短信码|动态码|一次性密码", re.I), "验证码"),
+    (re.compile(r"密码|口令|password|passwd|私钥|密钥|api[\s_-]?key", re.I), "密码/密钥"),
+    (re.compile(r"(身份证|银行卡|卡号|账号|账户)\s*[:：]?\s*\d"), "证件/账号信息"),
+    (re.compile(r"(转账|汇款|打款|付款|收款码|红包|提现)\s*[:：]?\s*\d"), "转账/付款金额"),
+)
 POLL = 0.4
 
 # 本工具不做「把微信窗口搬到屏幕外/改几何」这类“真静默”（2026-09-21 实测否定）：
@@ -862,10 +874,23 @@ def duplicate_send_guard(last_msgs, text: str, force: bool):
     return None
 
 
+def high_risk_hits(text: str) -> list:
+    """返回文本命中的高风险类别（本地正则，不联网）。"""
+    return [label for pat, label in HIGH_RISK_PATTERNS if pat.search(text or "")]
+
+
 def act_send(gui: Gui, job) -> dict:
     chat, text = job["chat"], job.get("text", "")
     if not job.get("confirm"):
         return {"ok": False, "error": "缺少 confirm=true，拒绝发送"}
+    # 确定性敏感词闸门：在任何鼠标/键盘动作之前就拦下
+    hits = high_risk_hits(text)
+    if hits:
+        if not job.get("allow_high_risk"):
+            return {"ok": False, "method": "blocked_high_risk",
+                    "error": ("已阻止发送：文本里含 " + "、".join(hits) + " 这类内容（金额/凭证发错不可逆）。"
+                              "确认无误确要照发，加 --allow-high-risk")}
+        log(f"  ⚠ 高风险内容经 --allow-high-risk 放行：{'、'.join(hits)}")
     pre = read_context(chat, 1)
     if READER is None:
         log("  未配置 WX_READER，跳过“疑似重复发送”检查")
