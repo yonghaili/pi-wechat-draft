@@ -31,6 +31,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1   # 建 venv + �
 
 可选：`WX_READER` 指向一个只读微信读取器（能读本地聊天库的 CLI），用于「另链路回读原文」这层证据与口语名字解析。不配置时功能完整，只是少这层证据。
 
+**静默档（建议开）**：`<WX_DIR>/wx-service.env`（每行 `KEY=VALUE`，改完 `wx svc stop && wx svc start`）：`WX_IDLE_GATE=20`（写字动作只在使用者停手 ≥20s 后才动手；默认 2s 会打断他）、`WX_IDLE_GATE_RO=0.5`（只读动作门槛）、`WX_IDLE_FALLBACK=600` / `WX_IDLE_FALLBACK_MIN=5`（等满 10 分钟无长空闲就降级，避免任务饿死）、`WX_IDLE_MAX_WAIT=60`（配合 `--now` 插队）、`WX_RESTORE_BLOCKERS=1`（还原被库最小化的遮挡窗口）。需要立即执行：`wx draft/send ... --now`。
+
 ## Procedure
 
 1. **确认目标**。口语称呼先用 `wx resolve "<关键词>"` 解析；返回多个候选时**必须问**，不要自己挑（实测同一称呼曾解析出 10 个候选，其中 9 个是零聊天记录的重名联系人）。挑选依据可以是「哪个有近期聊天记录」——用只读读取器逐个查证，而不是猜。
@@ -48,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1   # 建 venv + �
 
 **抢前台：只能用 Alt 键解锁法。** 同一台机器、同一起点连测四种方法：上游库 `bring_to_front(keep_topmost=True)` 抢不到（返回 False）；`bring_to_front(keep_topmost=False)` 从来没成功过；`SwitchToThisWindow` 抢不到；**`keybd_event(VK_MENU down/up)` 紧接 `SetForegroundWindow` → 10/10 成功**。原理：Windows 只允许「最后一个输入事件来自本进程」的进程修改前台。抢到之后要把焦点还给使用者原来的窗口（同样用 Alt 法）。
 
-**绝不要用上游库的 `ensure_visible()`。** 它会 `_minimize_blockers()` 把与微信重叠的其它窗口**最小化掉**，直接把使用者正在用的窗口收走。恢复微信自己只用 `ShowWindow(hwnd, SW_SHOW=5 / SW_RESTORE=9)`。
+**上游库会最小化使用者正在用的窗口，而且自己从不还原。** `WeChatGUI._minimize_blockers()`（`guia.py:915`）把所有与微信主窗重叠的其它顶层窗口 `ShowWindow(h, 6)` 最小化。这对库本身是必需的——它用物理点击，窗口被盖住时点击会被覆盖层接走；但它**从不还原**。注意：**`guia.open_chat()` 内部自己会调 `ensure_visible()`**（`guia.py:1306`），所以「调用方不用它的 ensure_visible」并不能避免这件事，必须打补丁。本工具的做法（`wx_service.py` 的 `install_library_patches()` / `restore_library_minimized()`）：保留最小化行为，但把被它最小化的窗口记下来，任务收尾时用库自己的 `_restore_keep_maximize(u32, hwnd)` 还原（会保留最大化状态）；已经不是最小化态的窗口不碰（使用者自己动过就不硬抢）。恢复微信**自己**只用 `ShowWindow(hwnd, SW_SHOW=5 / SW_RESTORE=9)`。
 
 **微信不在前台时，它的无障碍树是空壳。** `chat_input` / `search_box` / `session_list` 全是 `None`，`describe_layout().anchors` 全空。所以「不切前台静默写入」不存在，别在这条路上浪费时间；先切前台再取控件。
 

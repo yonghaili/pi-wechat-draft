@@ -56,9 +56,39 @@ _reader_env = os.environ.get("WX_READER", "").strip()
 READER = Path(_reader_env) if _reader_env else None
 SYS_PY = os.environ.get("WX_SYS_PY", "python")
 
-IDLE_GATE = float(os.environ.get("WX_IDLE_GATE", "2.0"))     # 动手前要求的空闲秒数
-IDLE_MAX_WAIT = float(os.environ.get("WX_IDLE_MAX_WAIT", "300"))  # 等不到空闲就先把任务放回队列
+# 运行期配置文件：<WX_DIR>/wx-service.env（KEY=VALUE，每行一个）。
+# 让「静默档」这类本机偏好不用改代码、也不用改自启包装就能生效。
+_ENVFILE = BASE / "wx-service.env"
+if _ENVFILE.exists():
+    try:
+        for _line in _ENVFILE.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#") or "=" not in _line:
+                continue
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+    except Exception:
+        pass
+
+IDLE_GATE = float(os.environ.get("WX_IDLE_GATE", "2.0"))     # 写字的动作要求的空闲秒数
+IDLE_GATE_RO = float(os.environ.get("WX_IDLE_GATE_RO", "0.5"))   # 只读动作（check/clear）要求的空闲秒数
+IDLE_MAX_WAIT = float(os.environ.get("WX_IDLE_MAX_WAIT", "300"))  # 等不到空闲就先放回队列
+# 降级兜底：实测本机 20s 空闲的到达率可能是 0%（一直在用电脑，或 HID 设备持续
+# 产生输入）。任务已等超过 IDLE_FALLBACK 秒时，退而求其次：只要能看到
+# IDLE_FALLBACK_MIN 秒的安静窗口就执行，避免任务被永久饿死在队列里。
+# 设为 0 = 禁用降级（宁可一直等，也绝不打断使用者）。
+IDLE_FALLBACK = float(os.environ.get("WX_IDLE_FALLBACK", "600"))
+IDLE_FALLBACK_MIN = float(os.environ.get("WX_IDLE_FALLBACK_MIN", "5"))
+# 任务收尾时把上游库为了“让路”而最小化的遮挡窗口还原（推荐开）
+RESTORE_BLOCKERS = os.environ.get("WX_RESTORE_BLOCKERS", "1").strip().lower() not in ("", "0", "false", "no")
 POLL = 0.4
+
+# 本工具不做「把微信窗口搬到屏幕外/改几何」这类“真静默”（2026-09-21 实测否定）：
+#   ① 库用 uiautomation 的 Control.Click() 打开会话，而它是 SetCursorPos +
+#      mouse_event 的物理点击；窗口一旦不在屏幕上，点击坐标就无效，打开会话必然失败；
+#   ② 库自己会在任务中改写窗口几何与其它窗口的可见性（guia.py 的 _minimize_blockers、
+#      _restore_keep_maximize），外部“记住原位再还原”不可靠，反而会把窗口挪到别处。
+# 所以静默只能靠“时机”：只在使用者长时间空闲时才动手（WX_IDLE_GATE）。
 
 u32 = ctypes.windll.user32
 k32 = ctypes.windll.kernel32
@@ -561,6 +591,95 @@ class Gui:
             return None
 
 
+def _job_waited(job) -> float:
+    """任务从入库到现在等了多久（秒）。用 job 里的 created 时间戳，无需额外记账。"""
+    try:
+        return max(0.0, (datetime.now() -
+                         datetime.fromisoformat(str(job.get("created")))).total_seconds())
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------- 上游库扰民行为：进程内补丁
+# 为什么要打补丁（2026-09-21 实测）：
+#   WeChatGUI._minimize_blockers（guia.py:915，被 ensure_visible 调用）会把所有
+#   与微信主窗重叠的其它顶层窗口 ShowWindow(h, 6) 最小化，而且**从不还原**。
+#   这个行为对库本身是必需的：它用物理鼠标点击，窗口被覆盖时点击会被覆盖层接走。
+#   所以本工具不阻止它，而是把被最小化的窗口记下来，任务收尾时用库自己的
+#   _restore_keep_maximize 还原（那个函数会保留最大化状态）。
+# 另外：不做"记住微信窗口几何再还原"——库自身会在任务中改写几何，
+#   _minimize_blockers 之外还有 _restore_keep_maximize 等路径，外部记录不可靠
+#   （实测还原后落到别的坐标），所以只负责把②的遮挡窗口还回去。
+_LIB_MINIMIZED: list[int] = []
+_PATCHED = False
+
+
+def install_library_patches() -> None:
+    """给 wechatauto 的“最小化遮挡窗口”行为打进程内补丁（不修改 site-packages）。"""
+    global _PATCHED
+    if _PATCHED:
+        return
+    try:
+        from wechatauto import guia
+    except Exception as e:
+        log(f"  库补丁跳过（导入 wechatauto 失败）: {e}")
+        return
+    cls = getattr(guia, "WeChatGUI", None)
+    if cls is None or not hasattr(cls, "_minimize_blockers"):
+        log("  库补丁跳过（找不到 WeChatGUI._minimize_blockers）")
+        return
+    orig = cls._minimize_blockers
+
+    def _visible_set() -> set:
+        return {h for h, _pid, vis, iconic, _cls, _t in enum_top_windows() if vis and not iconic}
+
+    def patched(self):
+        before = _visible_set()
+        try:
+            n = orig(self)
+        except Exception as e:
+            log(f"  _minimize_blockers 异常: {e}")
+            n = 0
+        for h in before - _visible_set():
+            if h not in _LIB_MINIMIZED:
+                _LIB_MINIMIZED.append(h)
+        return n
+
+    cls._minimize_blockers = patched
+    _PATCHED = True
+    log("  已给上游库打补丁：遮挡窗口被它最小化后会由本工具还原")
+
+
+def restore_library_minimized() -> int:
+    """把上游库为“让路”而最小化的窗口还原（保留其最大化状态）。"""
+    pending = list(_LIB_MINIMIZED)
+    _LIB_MINIMIZED.clear()
+    if not pending or not RESTORE_BLOCKERS:
+        return 0
+    try:
+        from wechatauto import guia
+        restore_one = getattr(guia, "_restore_keep_maximize", None)
+    except Exception:
+        restore_one = None
+    n = 0
+    for h in pending:
+        try:
+            if not u32.IsWindow(wintypes.HWND(h)):
+                continue
+            if not u32.IsIconic(wintypes.HWND(h)):
+                continue          # 已经不是最小化态（使用者自己动过）→ 不碰
+            if restore_one is not None:
+                restore_one(u32, h)
+            else:
+                u32.ShowWindow(wintypes.HWND(h), 9)     # SW_RESTORE
+            n += 1
+        except Exception as e:
+            log(f"  还原遮挡窗口 {h} 失败: {e}")
+    if n:
+        log(f"  已还原被库最小化的遮挡窗口 {n} 个")
+    return n
+
+
 def wait_idle(need: float = IDLE_GATE, budget: float = IDLE_MAX_WAIT) -> bool:
     t0 = time.time()
     while True:
@@ -825,6 +944,16 @@ GUI = Gui()          # 模块级单例：WeChatGUI / UIA 引擎跨任务复用�
 def claim_job():
     QUEUE.mkdir(parents=True, exist_ok=True)
     jobs = sorted(p for p in QUEUE.glob("*.job"))
+
+    # --now 的任务（immediate）优先取：否则它会排在一个正在等空闲的老任务后面，
+    # 而那个老任务能把服务占住 IDLE_MAX_WAIT 那么久，插队能力就白给了。
+    def _is_now(p):
+        try:
+            return bool(json.loads(p.read_text(encoding="utf-8")).get("immediate"))
+        except Exception:
+            return False
+
+    jobs.sort(key=lambda p: (0 if _is_now(p) else 1, p.name))
     for p in jobs:
         working = p.with_suffix(".working")
         try:
@@ -915,7 +1044,11 @@ def run_job(job) -> dict:
     res["seconds"] = round(time.time() - started, 1)
     res["foreground_seconds"] = (round(time.time() - gui.front_started, 1)
                                  if gui.front_started else 0)
-    # 收尾还原：取消置顶 → 光标 → 原前台窗口
+    # 收尾还原：上游库最小化的遮挡窗口 → 取消置顶 → 光标 → 原前台窗口
+    try:
+        res["blockers_restored"] = restore_library_minimized()
+    except Exception as e:
+        log(f"  还原遮挡窗口异常: {e}")
     try:
         gui.restore_topmost()
         if cursor_pos() != prev_cursor:
@@ -940,6 +1073,7 @@ def main() -> int:
         except Exception:
             pass
     PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+    install_library_patches()        # 给上游库的“最小化遮挡窗口”行为打补丁
     idle_ok = idle_detector_usable(need=2.0, samples=20, interval=0.3)
     gate = IDLE_GATE                 # 闸门始终生效：只在真正空闲时才动手
     log(f"服务启动 pid={os.getpid()} idle_gate={gate}s")
@@ -965,7 +1099,15 @@ def main() -> int:
             time.sleep(POLL)
             continue
         # 写字的动作（draft/send）等一次真正的停顿；只读/纠错的（check/clear）不苛求
-        need = IDLE_GATE if job.get("action") in ("draft", "send") else 0.5
+        need = IDLE_GATE if job.get("action") in ("draft", "send") else IDLE_GATE_RO
+        if job.get("immediate"):
+            need = 0.0               # 使用者显式要求立即执行（wx ... --now）
+        elif need > 0 and IDLE_FALLBACK > 0:
+            _waited = _job_waited(job)
+            if _waited > IDLE_FALLBACK:
+                log(f"[{job.get('id')}] 已等 {_waited:.0f}s 仍未见 {need:.0f}s 长空闲"
+                    f"（你可能一直在用电脑），降级为「≥{IDLE_FALLBACK_MIN:.0f}s 安静」执行")
+                need = IDLE_FALLBACK_MIN
         if not wait_idle(need, IDLE_MAX_WAIT):
             log(f"[{job.get('id')}] 你一直在操作电脑，任务放回队列等下一轮")
             working.rename(QUEUE / working.name.replace(".working", ".job"))
@@ -975,7 +1117,12 @@ def main() -> int:
             f"空闲 {idle_seconds():.1f}s，开始执行")
         _t = time.time()
         t0 = _t
-        res = run_job(job)
+        try:
+            res = run_job(job)
+        except Exception:
+            # 单个任务抛任何异常都不允许把常驻服务带走（2026-09-21 实际踩到：
+            # run_job 里一个 NameError 让服务反复崩溃、任务变遗属文件、客户端只看到「已排队」）
+            res = {"ok": False, "error": "任务异常: " + traceback.format_exc(limit=4)}
         res.update({"id": job.get("id"), "action": job.get("action"),
                     "chat": job.get("chat"), "text": job.get("text"),
                     "finished_at": datetime.now().isoformat(timespec="seconds")})
