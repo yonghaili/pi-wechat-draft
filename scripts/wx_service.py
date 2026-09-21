@@ -83,8 +83,8 @@ IDLE_FALLBACK_MIN = float(os.environ.get("WX_IDLE_FALLBACK_MIN", "5"))
 RESTORE_BLOCKERS = os.environ.get("WX_RESTORE_BLOCKERS", "1").strip().lower() not in ("", "0", "false", "no")
 # 发送前的确定性敏感词闸门（本地、离线，不依赖网络与模型）。
 # 为什么单独硬拦这一层：金额与凭证发出去是不可逆的（发错账户/泄露验证码），
-# 所以不能只靠“判断层提醒”。只拦「客观危险」两类；承诺/时间类不拦——那是日常
-# 沟通的常态，交给 Jev 判断层提醒（见 scripts/jev_advise.py）。
+# 所以在这一步做一次确定性硬拦。只拦「客观危险」的两类（金额与凭证）；
+# 承诺/时间类不拦——那是日常沟通的常态，由使用者在草稿阶段自己核对。
 # 确实要照发必须显式加 --allow-high-risk（会记日志）。
 HIGH_RISK_PATTERNS = (
     (re.compile(r"\b\d{16,19}\b"), "16-19 位长数字（银行卡/账号）"),
